@@ -384,19 +384,28 @@ impl Drop for HelperThread {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "redox"))]
 mod imp {
     extern crate libc;
+
+    #[cfg(target_os = "redox")]
+    extern crate syscall;
+
+    #[cfg(not(target_os = "redox"))]
+    use self::libc::sigaction;
+    #[cfg(target_os = "redox")]
+    use self::syscall::SigAction as sigaction;
 
     use std::fs::File;
     use std::io::{self, Read, Write};
     use std::mem;
     use std::os::unix::prelude::*;
     use std::process::Command;
+    #[cfg(not(target_os = "redox"))]
     use std::ptr;
-    use std::sync::atomic::{AtomicBool, AtomicUsize,
-                            ATOMIC_BOOL_INIT, ATOMIC_USIZE_INIT,
-                            Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    #[cfg(not(target_os = "redox"))]
+    use std::sync::atomic::{AtomicUsize, ATOMIC_BOOL_INIT, ATOMIC_USIZE_INIT};
     use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
     use std::sync::{Arc, Once, ONCE_INIT};
     use std::thread::{self, JoinHandle, Builder};
@@ -427,6 +436,7 @@ mod imp {
             Ok(client)
         }
 
+        #[cfg(not(target_os = "redox"))]
         unsafe fn mk() -> io::Result<Client> {
             static INVALID: AtomicBool = ATOMIC_BOOL_INIT;
             let mut pipes = [0; 2];
@@ -449,6 +459,13 @@ mod imp {
             cvt(libc::pipe(pipes.as_mut_ptr()))?;
             drop(set_cloexec(pipes[0], true));
             drop(set_cloexec(pipes[1], true));
+            Ok(Client::from_fds(pipes[0], pipes[1]))
+        }
+
+        #[cfg(target_os = "redox")]
+        unsafe fn mk() -> io::Result<Client> {
+            let mut pipes = [0; 2];
+            cvt_redox(syscall::pipe2(&mut pipes, syscall::O_CLOEXEC))?;
             Ok(Client::from_fds(pipes[0], pipes[1]))
         }
 
@@ -487,7 +504,7 @@ mod imp {
             }
         }
 
-        unsafe fn from_fds(read: c_int, write: c_int) -> Client {
+        unsafe fn from_fds(read: RawFd, write: RawFd) -> Client {
             Client {
                 read: File::from_raw_fd(read),
                 write: File::from_raw_fd(write),
@@ -516,7 +533,7 @@ mod imp {
             // to shut us down, so we otherwise punt all errors upwards.
             unsafe {
                 let mut fd: libc::pollfd = mem::zeroed();
-                fd.fd = self.read.as_raw_fd();
+                fd.fd = self.read.as_raw_fd() as c_int;
                 fd.events = libc::POLLIN;
                 loop {
                     fd.revents = 0;
@@ -586,11 +603,19 @@ mod imp {
         static USR1_INIT: Once = ONCE_INIT;
         let mut err = None;
         USR1_INIT.call_once(|| unsafe {
-            let mut new: libc::sigaction = mem::zeroed();
-            new.sa_sigaction = sigusr1_handler as usize;
-            new.sa_flags = libc::SA_SIGINFO as _;
-            if libc::sigaction(libc::SIGUSR1, &new, ptr::null_mut()) != 0 {
-                err = Some(io::Error::last_os_error());
+            let mut new: sigaction = mem::zeroed();
+            #[cfg(not(target_os = "redox"))]
+            {
+                new.sa_flags = libc::SA_SIGINFO as _;
+                new.sa_sigaction = sigusr1_handler as usize;
+                if libc::sigaction(libc::SIGUSR1, &new, ptr::null_mut()) != 0 {
+                    err = Some(io::Error::last_os_error());
+                }
+            }
+            #[cfg(target_os = "redox")]
+            {
+                new.sa_handler = sigusr1_handler;
+                err = cvt_redox(syscall::sigaction(syscall::SIGUSR1, Some(&new), None)).err();
             }
         });
 
@@ -635,13 +660,21 @@ mod imp {
             let dur = Duration::from_millis(10);
             let mut done = false;
             for _ in 0..100 {
-                unsafe {
+                {
                     // Ignore the return value here of `pthread_kill`,
                     // apparently on OSX if you kill a dead thread it will
                     // return an error, but on other platforms it may not. In
                     // that sense we don't actually know if this will succeed or
                     // not!
-                    libc::pthread_kill(self.thread.as_pthread_t(), libc::SIGUSR1);
+                    #[cfg(not(target_os = "redox"))]
+                    unsafe {
+                        use std::os::unix::thread::JoinHandleExt;
+                        libc::pthread_kill(self.thread.as_pthread_t(), libc::SIGUSR1);
+                    }
+                    #[cfg(target_os = "redox")]
+                    {
+                        let _ = syscall::kill(self.thread.as_pthread_t(), syscall::SIGUSR1);
+                    }
                     match self.rx_done.recv_timeout(dur) {
                         Ok(()) |
                         Err(RecvTimeoutError::Disconnected) => {
@@ -659,13 +692,15 @@ mod imp {
         }
     }
 
-    fn is_valid_fd(fd: c_int) -> bool {
+    fn is_valid_fd(fd: RawFd) -> bool {
+        let fd = fd as c_int;
         unsafe {
             return libc::fcntl(fd, libc::F_GETFD) != -1;
         }
     }
 
-    fn set_cloexec(fd: c_int, set: bool) -> io::Result<()> {
+    fn set_cloexec(fd: RawFd, set: bool) -> io::Result<()> {
+        let fd = fd as c_int;
         unsafe {
             let previous = cvt(libc::fcntl(fd, libc::F_GETFD))?;
             let new = if set {
@@ -688,6 +723,12 @@ mod imp {
         }
     }
 
+    #[cfg(target_os = "redox")]
+    fn cvt_redox(t: syscall::Result<usize>) -> io::Result<usize> {
+        t.map_err(|err| io::Error::from_raw_os_error(err.errno))
+    }
+
+    #[cfg(not(target_os = "redox"))]
     unsafe fn pipe2() -> Option<&'static fn(*mut c_int, c_int) -> c_int> {
         static PIPE2: AtomicUsize = ATOMIC_USIZE_INIT;
 
@@ -706,6 +747,12 @@ mod imp {
         }
     }
 
+    #[cfg(target_os = "redox")]
+    extern fn sigusr1_handler(_signum: usize) {
+        // nothing to do
+    }
+
+    #[cfg(not(target_os = "redox"))]
     extern fn sigusr1_handler(_signum: c_int,
                               _info: *mut libc::siginfo_t,
                               _ptr: *mut libc::c_void) {
