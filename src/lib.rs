@@ -597,7 +597,7 @@ mod imp {
 
     pub fn spawn_helper(client: ::Client,
                         rx: Receiver<()>,
-                        mut f: Box<FnMut(io::Result<::Acquired>) + Send>)
+                        mut f: Box<dyn FnMut(io::Result<::Acquired>) + Send>)
         -> io::Result<Helper>
     {
         static USR1_INIT: Once = ONCE_INIT;
