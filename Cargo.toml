@@ -13,8 +13,11 @@ An implementation of the GNU make jobserver for Rust
 [dependencies]
 log = "0.4"
 
-[target.'cfg(unix)'.dependencies]
+[target.'cfg(any(unix, target_os = "redox"))'.dependencies]
 libc = "0.2"
+
+[target.'cfg(target_os = "redox")'.dependencies]
+redox_syscall = "0.1"
 
 [target.'cfg(windows)'.dependencies]
 rand = "0.6"
