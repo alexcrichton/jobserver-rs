@@ -80,6 +80,7 @@
 
 use std::env;
 use std::io;
+use std::panic;
 use std::process::Command;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
@@ -464,7 +465,16 @@ impl HelperState {
             // wait for a long time for a token.
             lock.requests -= 1;
             drop(lock);
-            f();
+
+            // Run `f`, but mark ourself as done if it panics.
+            if let Err(panic) = panic::catch_unwind(panic::AssertUnwindSafe(|| f())) {
+                let mut lock = self.lock();
+                lock.consumer_done = true;
+                self.cvar.notify_one();
+                drop(lock);
+                panic::resume_unwind(panic);
+            }
+
             lock = self.lock();
         }
         lock.consumer_done = true;
@@ -582,6 +592,14 @@ mod imp {
         }
 
         pub fn acquire(&self) -> io::Result<Acquired> {
+            self.try_acquire(&mut || false).unwrap()
+        }
+
+        /// Tries to acquire a token. Returns `None` if the operation was terminated.
+        fn try_acquire(
+            &self,
+            terminated: &mut dyn FnMut() -> bool,
+        ) -> Option<io::Result<Acquired>> {
             // We don't actually know if the file descriptor here is set in
             // blocking or nonblocking mode. AFAIK all released versions of
             // `make` use blocking fds for the jobserver, but the unreleased
@@ -610,8 +628,13 @@ mod imp {
                     if libc::poll(&mut fd, 1, -1) == -1 {
                         let e = io::Error::last_os_error();
                         match e.kind() {
-                            io::ErrorKind::Interrupted => continue,
-                            _ => return Err(e),
+                            io::ErrorKind::Interrupted => {
+                                if terminated() {
+                                    return None;
+                                };
+                                continue;
+                            }
+                            _ => return Some(Err(e)),
                         }
                     }
                     if fd.revents == 0 {
@@ -619,16 +642,22 @@ mod imp {
                     }
                     let mut buf = [0];
                     match (&self.read).read(&mut buf) {
-                        Ok(1) => return Ok(Acquired { byte: buf[0] }),
+                        Ok(1) => return Some(Ok(Acquired { byte: buf[0] })),
                         Ok(_) => {
-                            return Err(io::Error::new(
+                            return Some(Err(io::Error::new(
                                 io::ErrorKind::Other,
                                 "early EOF on jobserver pipe",
-                            ))
+                            )))
                         }
                         Err(e) => match e.kind() {
-                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => continue,
-                            _ => return Err(e),
+                            io::ErrorKind::WouldBlock => continue,
+                            io::ErrorKind::Interrupted => {
+                                if terminated() {
+                                    return None;
+                                };
+                                continue;
+                            }
+                            _ => return Some(Err(e)),
                         },
                     }
                 }
@@ -699,7 +728,20 @@ mod imp {
 
         let state2 = state.clone();
         let thread = Builder::new().spawn(move || {
-            state2.for_each_request(|| f(client.acquire()));
+            state2.for_each_request(|| {
+                let token = if let Some(token) = client
+                    .inner
+                    .try_acquire(&mut || state2.lock().producer_done)
+                {
+                    token.map(|data| super::Acquired {
+                        client: client.inner.clone(),
+                        data: data,
+                    })
+                } else {
+                    return;
+                };
+                f(token)
+            });
         })?;
 
         Ok(Helper { thread, state })
@@ -718,14 +760,7 @@ mod imp {
             // of interrupting that, so resort to `pthread_kill` as a fallback.
             // This signal should interrupt any blocking `read` call with
             // `io::ErrorKind::Interrupt` and cause the thread to cleanly exit.
-            //
-            // Note that we don'tdo this forever though since there's a chance
-            // of bugs, so only do this opportunistically to make a best effort
-            // at clearing ourselves up.
-            for _ in 0..100 {
-                if state.consumer_done {
-                    break;
-                }
+            while !state.consumer_done {
                 unsafe {
                     // Ignore the return value here of `pthread_kill`,
                     // apparently on OSX if you kill a dead thread it will
